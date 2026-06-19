@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest
+.pytest_cache/
+
+# Allure — runtime output, never commit
+allure-results/
+reports/
+
+# Environment files — contain credentials, never commit
+.env
+environments/*.env
+!environments/tenant_template.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
