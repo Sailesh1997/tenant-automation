@@ -313,15 +313,15 @@ def test_tc3_property_group_total_properties():
 # TC-4: TDW Payment Misc Attribute Normalization and Prepaid Flag
 # ─────────────────────────────────────────────────────────────────────────────
 _DSA_TC4 = """
-SELECT src_payment_allocation_id,
-       src_payment_id,
-       payment_status_cd,
-       payment_method_cd,
+SELECT payment_allocation_id AS src_payment_allocation_id,
+       payment_id            AS src_payment_id,
+       payment_status        AS payment_status_cd,
+       payment_method        AS payment_method_cd,
        prepaid_flg,
-       credit_type_cd
+       credit_type           AS credit_type_cd
 FROM {dsa}.dsa_payment_allocation_tf
 WHERE company_uid = '{CUID}'
-ORDER BY src_payment_allocation_id
+ORDER BY payment_allocation_id
 LIMIT 100
 """
 
@@ -415,12 +415,12 @@ def test_tc4_payment_misc_attr():
 # ─────────────────────────────────────────────────────────────────────────────
 _DSA_TC5 = """
 SELECT discount_id,
-       src_promotion_id,
-       start_date,
-       end_date,
-       src_property_id,
-       src_unit_id,
-       src_lease_id,
+       promotion_id AS src_promotion_id,
+       start        AS start_date,
+       "end"        AS end_date,
+       property_id  AS src_property_id,
+       unit_id      AS src_unit_id,
+       lease_id     AS src_lease_id,
        amount
 FROM {dsa}.dsa_discount_applied_tf
 WHERE company_uid = '{CUID}'
@@ -605,17 +605,17 @@ def test_tc6_invoice_line():
 # TC-7: TDW Payment Allocation Date and Dimension Resolution
 # ─────────────────────────────────────────────────────────────────────────────
 _DSA_TC7 = """
-SELECT src_payment_allocation_id,
-       src_payment_id,
+SELECT payment_allocation_id     AS src_payment_allocation_id,
+       payment_id                AS src_payment_id,
        allocation_date,
        payment_date,
        property_id,
        contact_id,
        src_lease_id,
-       amount
+       payment_allocation_amount AS amount
 FROM {dsa}.dsa_payment_allocation_tf
 WHERE company_uid = '{CUID}'
-ORDER BY src_payment_allocation_id
+ORDER BY payment_allocation_id
 LIMIT 100
 """
 
@@ -1016,7 +1016,7 @@ def test_tc10_reservations():
 _DSA_TC11 = """
 SELECT src_service_id,
        src_lease_id,
-       src_property_id,
+       property_id        AS src_property_id,
        service_start_date,
        service_end_date,
        service_price,

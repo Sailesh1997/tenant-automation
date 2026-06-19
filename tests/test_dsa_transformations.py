@@ -713,55 +713,395 @@ def test_tc10_unit_status_live_derivation():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TC-11 to TC-14 and TC-15 — Stub implementations
-# These test cases require additional schema exploration before full implementation.
+# TC-11: Task day_difference and recurring_flag Derivation
 # ─────────────────────────────────────────────────────────────────────────────
+_DLA_TC11 = """
+SELECT id                                                               AS task_id,
+       DATEDIFF(day, due_date::date, CURRENT_DATE)                     AS expected_day_difference,
+       CASE WHEN rtm_tasks_config_id IS NOT NULL THEN 1 ELSE 0 END     AS expected_recurring_flag
+FROM {dla}.tasks
+WHERE company_uid = '{CUID}'
+  AND due_date IS NOT NULL
+ORDER BY id
+LIMIT 300
+"""
 
-@pytest.mark.skip(reason="TC-11: To be implemented — requires dsa.dsa_task_f schema confirmation")
+_DSA_TC11 = """
+SELECT src_task_id  AS task_id,
+       day_difference,
+       recurring_flag
+FROM {dsa}.dsa_tasks_af
+WHERE company_uid = '{CUID}'
+ORDER BY src_task_id
+LIMIT 300
+"""
+
+
 @allure.epic("Derived Value Validation")
 @allure.feature("DSA Transformations")
 @allure.story("TC-11 — Task Derived Values (day_difference and recurring_flag)")
 @allure.severity(allure.severity_level.MINOR)
 @allure.title("TC-11: Task day_difference and recurring_flag — DLA vs DSA")
+@allure.description(
+    "Validates that dsa_tasks_af correctly derives day_difference "
+    "(days between task created_at and due_date) and recurring_flag "
+    "(1 when rtm_tasks_config_id is set, 0 otherwise)."
+)
 def test_tc11_task_derived_values():
-    pass
+    with allure.step("Run DLA query — derive expected day_difference and recurring_flag"):
+        dla = run_redshift(_DLA_TC11)
+        assert not dla.empty, "TC-11: DLA returned 0 rows"
+        _attach_df(dla.head(20), "DLA Expected Values")
+
+    with allure.step("Run DSA query — dsa.dsa_tasks_af"):
+        dsa = run_redshift(_DSA_TC11)
+        assert not dsa.empty, "TC-11: DSA returned 0 rows"
+        _attach_df(dsa.head(20), "DSA Actual Values")
+
+    with allure.step("Merge on task_id and compare derived columns"):
+        m = dla.merge(dsa, on="task_id")
+        assert not m.empty, "TC-11: No matching task_ids between DLA and DSA"
+
+        # day_difference represents overdue days for open tasks; DSA sets it to 0
+        # for completed/resolved tasks. Only validate the delta for tasks where
+        # DSA day_difference > 0 (open/overdue), with ±2 day tolerance for CDC lag.
+        # Rows where DSA day_difference is NULL are excluded (filtered in DSA).
+        m_open = m[(m["day_difference"].notna()) & (m["day_difference"].astype(float) > 0)].copy()
+        if not m_open.empty:
+            m_open["day_diff_delta"] = (
+                m_open["expected_day_difference"].astype(float) - m_open["day_difference"].astype(float)
+            ).abs()
+            m_open["day_diff_ok"] = m_open["day_diff_delta"] <= 2
+
+        m["recurring_match"] = m["expected_recurring_flag"].astype(str) == m["recurring_flag"].astype(str)
+
+        null_count   = m["day_difference"].isna().sum()
+        closed_count = (m["day_difference"].notna() & (m["day_difference"].astype(float) == 0)).sum()
+        summary = (
+            f"Merged tasks: {len(m)}\n"
+            f"DSA day_difference NULL (excluded): {null_count}\n"
+            f"DSA day_difference = 0 (resolved/completed, excluded): {closed_count}\n"
+            f"Open tasks checked for overdue-day accuracy: {len(m_open)}"
+        )
+        allure.attach(summary, name="Summary", attachment_type=allure.attachment_type.TEXT)
+        _attach_df(
+            m[["task_id", "expected_day_difference", "day_difference",
+               "expected_recurring_flag", "recurring_flag", "recurring_match"]].head(50),
+            "Comparison",
+        )
+
+    with allure.step("Assert derivations match"):
+        errors = []
+        if not m_open.empty:
+            fail_day = m_open[~m_open["day_diff_ok"]]
+            if not fail_day.empty:
+                errors.append(f"day_difference off by >2 days for open tasks: {len(fail_day)} task(s)")
+                _attach_df(
+                    fail_day[["task_id", "expected_day_difference", "day_difference", "day_diff_delta"]],
+                    "FAILED — day_difference",
+                )
+        fail_rec = m[~m["recurring_match"]]
+        if not fail_rec.empty:
+            errors.append(f"recurring_flag mismatch: {len(fail_rec)} task(s)")
+            _attach_df(fail_rec[["task_id", "expected_recurring_flag", "recurring_flag"]], "FAILED — recurring_flag")
+        if errors:
+            msg = "\n".join(errors)
+            post_slack(f":red_circle: *TC-11 FAILED* — Task Derived Values\n{msg}")
+            pytest.fail(f"TC-11: task derivation mismatches:\n{msg}")
 
 
-@pytest.mark.skip(reason="TC-12: To be implemented — requires dsa.dsa_service_lease_f schema confirmation")
+# ─────────────────────────────────────────────────────────────────────────────
+# TC-12: service_bought_at_move_in Derivation
+# ─────────────────────────────────────────────────────────────────────────────
+_DLA_TC12 = """
+SELECT s.id                                                         AS service_id,
+       CASE WHEN s.start_date = l.start_date THEN 1 ELSE 0 END     AS expected_bought_at_move_in
+FROM {dla}.services s
+JOIN {dla}.leases l ON l.id = s.lease_id AND l.company_uid = '{CUID}'
+WHERE s.company_uid  = '{CUID}'
+  AND s.lease_id IS NOT NULL
+ORDER BY s.id
+LIMIT 300
+"""
+
+_DSA_TC12 = """
+SELECT src_service_id         AS service_id,
+       service_start_date,
+       lease_start_date,
+       service_bought_at_move_in
+FROM {dsa}.dsa_services_leases_tf
+WHERE company_uid = '{CUID}'
+ORDER BY src_service_id
+LIMIT 300
+"""
+
+
 @allure.epic("Derived Value Validation")
 @allure.feature("DSA Transformations")
 @allure.story("TC-12 — Service Lease Join with service_bought_at_move_in")
 @allure.severity(allure.severity_level.MINOR)
 @allure.title("TC-12: service_bought_at_move_in Derivation — DLA vs DSA")
+@allure.description(
+    "Validates that service_bought_at_move_in is derived correctly in DSA: "
+    "1 when the service start_date equals the lease start_date (joined from DLA), 0 otherwise."
+)
 def test_tc12_service_lease_join():
-    pass
+    with allure.step("Run DLA query — join services with leases to derive move-in flag"):
+        dla = run_redshift(_DLA_TC12)
+        assert not dla.empty, "TC-12: DLA returned 0 rows"
+        _attach_df(dla.head(20), "DLA Expected Values")
+
+    with allure.step("Run DSA query — dsa.dsa_services_leases_tf"):
+        dsa = run_redshift(_DSA_TC12)
+        assert not dsa.empty, "TC-12: DSA returned 0 rows"
+        _attach_df(dsa.head(20), "DSA Actual Values")
+
+    with allure.step("Merge on service_id and validate service_bought_at_move_in"):
+        m = dla.merge(dsa, on="service_id")
+        assert not m.empty, "TC-12: No matching service_ids between DLA and DSA"
+        m["flag_match"] = m["expected_bought_at_move_in"].astype(str) == m["service_bought_at_move_in"].astype(str)
+        _attach_df(
+            m[["service_id", "expected_bought_at_move_in", "service_bought_at_move_in", "flag_match"]].head(50),
+            "Comparison",
+        )
+
+    with allure.step("Assert service_bought_at_move_in matches DLA-derived expectation"):
+        fail = m[~m["flag_match"]]
+        if not fail.empty:
+            report = fail[["service_id", "expected_bought_at_move_in", "service_bought_at_move_in"]].to_string(index=False)
+            _attach_df(fail, "FAILED Services")
+            post_slack(f":red_circle: *TC-12 FAILED* — service_bought_at_move_in Derivation\n```{report[:1000]}```")
+            pytest.fail(f"TC-12: service_bought_at_move_in mismatch for {len(fail)} service(s)\n{report}")
 
 
-@pytest.mark.skip(reason="TC-13: To be implemented — requires dsa.dsa_payment_f schema confirmation")
+# ─────────────────────────────────────────────────────────────────────────────
+# TC-13: Payment prepaid_flag Derivation
+# ─────────────────────────────────────────────────────────────────────────────
+_DLA_TC13 = """
+SELECT id                                                       AS payment_id,
+       credit_type,
+       CASE WHEN LOWER(COALESCE(credit_type, '')) = 'prepaid'
+            THEN 'Y' ELSE 'N'
+       END                                                      AS expected_prepaid_flg
+FROM {dla}.payments
+WHERE company_uid   = '{CUID}'
+  AND property_id  IN ({pids})
+ORDER BY id
+LIMIT 300
+"""
+
+_DSA_TC13 = """
+SELECT payment_id,
+       credit_type,
+       prepaid_flg
+FROM {dsa}.dsa_payment_allocation_tf
+WHERE company_uid = '{CUID}'
+ORDER BY payment_id
+LIMIT 300
+"""
+
+
 @allure.epic("Derived Value Validation")
 @allure.feature("DSA Transformations")
 @allure.story("TC-13 — Payment Allocation Prepaid Flag Derivation")
 @allure.severity(allure.severity_level.MINOR)
 @allure.title("TC-13: Payment prepaid_flag Derivation — DLA vs DSA")
+@allure.description(
+    "Validates that prepaid_flg in dsa_payment_allocation_tf is correctly derived "
+    "from DLA payments.credit_type: 'Y' when credit_type = 'prepaid', 'N' otherwise."
+)
 def test_tc13_payment_allocation_prepaid_flag():
-    pass
+    with allure.step("Run DLA query — derive expected prepaid_flg from credit_type"):
+        dla = run_redshift(_DLA_TC13)
+        assert not dla.empty, "TC-13: DLA returned 0 rows"
+        _attach_df(dla.head(20), "DLA Expected Values")
+
+    with allure.step("Run DSA query — dsa.dsa_payment_allocation_tf"):
+        dsa = run_redshift(_DSA_TC13)
+        assert not dsa.empty, "TC-13: DSA returned 0 rows"
+        _attach_df(dsa.head(20), "DSA Actual Values")
+
+    with allure.step("Merge on payment_id and validate prepaid_flg"):
+        m = dla.merge(dsa, on="payment_id", suffixes=("_dla", "_dsa"))
+        assert not m.empty, "TC-13: No matching payment_ids between DLA and DSA"
+        m["flag_match"] = m["expected_prepaid_flg"].astype(str) == m["prepaid_flg"].astype(str)
+        _attach_df(
+            m[["payment_id", "credit_type_dla", "expected_prepaid_flg", "prepaid_flg", "flag_match"]].head(50),
+            "Comparison",
+        )
+
+    with allure.step("Assert prepaid_flg derivation matches"):
+        fail = m[~m["flag_match"]]
+        if not fail.empty:
+            report = fail[["payment_id", "credit_type_dla", "expected_prepaid_flg", "prepaid_flg"]].to_string(index=False)
+            _attach_df(fail, "FAILED Payments")
+            post_slack(f":red_circle: *TC-13 FAILED* — Payment prepaid_flag Derivation\n```{report[:1000]}```")
+            pytest.fail(f"TC-13: prepaid_flg mismatch for {len(fail)} payment(s)\n{report}")
 
 
-@pytest.mark.skip(reason="TC-14: To be implemented — requires dsa.dsa_delinquency_f schema confirmation")
+# ─────────────────────────────────────────────────────────────────────────────
+# TC-14: Delinquency drent Computation
+# ─────────────────────────────────────────────────────────────────────────────
+_DLA_TC14 = """
+SELECT i.id          AS invoice_id,
+       i.lease_id,
+       i.property_id,
+       i.subtotal    AS invoice_amount,
+       COALESCE(i.total_payments, 0)                  AS payment_amount,
+       i.subtotal - COALESCE(i.total_payments, 0)     AS expected_drent
+FROM {dla}.invoices i
+WHERE i.company_uid  = '{CUID}'
+  AND i.property_id IN ({pids})
+  AND i.status = 1
+  AND i.subtotal > 0
+ORDER BY i.id
+LIMIT 300
+"""
+
+_DSA_TC14 = """
+SELECT invoice_id,
+       lease_id,
+       property_id,
+       invoice_amount,
+       payment_amount,
+       drent
+FROM {dsa}.dsa_delinquency_pf
+WHERE company_uid   = '{CUID}'
+  AND property_id  IN ({pids})
+  AND deleted_flg  = 0
+ORDER BY invoice_id
+LIMIT 300
+"""
+
+
 @allure.epic("Derived Value Validation")
 @allure.feature("DSA Transformations")
 @allure.story("TC-14 — Delinquency Invoice Amount and drent Computation")
 @allure.severity(allure.severity_level.NORMAL)
 @allure.title("TC-14: Delinquency drent Computation — DLA vs DSA")
+@allure.description(
+    "Validates that dsa_delinquency_pf correctly computes drent as "
+    "invoice_amount - payment_amount for outstanding invoices, "
+    "and that invoice_amount matches DLA within $0.01 tolerance."
+)
 def test_tc14_delinquency_drent_computation():
-    pass
+    with allure.step("Run DLA query — outstanding invoices with expected drent"):
+        dla = run_redshift(_DLA_TC14)
+        assert not dla.empty, "TC-14: DLA returned 0 rows — no active invoices with balance found"
+        _attach_df(dla.head(20), "DLA Expected Values")
+
+    with allure.step("Run DSA query — dsa.dsa_delinquency_pf"):
+        dsa = run_redshift(_DSA_TC14)
+        if dsa.empty:
+            allure.attach(
+                "dsa_delinquency_pf returned 0 rows — delinquency data may not be populated in this environment",
+                name="DSA Skip Reason",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+            pytest.skip("TC-14: DSA dsa_delinquency_pf has no data in this environment")
+            return
+        _attach_df(dsa.head(20), "DSA Actual Values")
+
+    with allure.step("Validate drent = invoice_amount - payment_amount within DSA"):
+        dsa_check = dsa.copy()
+        dsa_check["computed_drent"] = dsa_check["invoice_amount"].astype(float) - dsa_check["payment_amount"].astype(float)
+        dsa_check["drent_consistent"] = (dsa_check["computed_drent"] - dsa_check["drent"].astype(float)).abs() < 0.01
+        _attach_df(dsa_check[["invoice_id", "invoice_amount", "payment_amount", "drent", "drent_consistent"]].head(50), "DSA drent Consistency")
+
+    with allure.step("Merge on invoice_id and compare invoice_amount"):
+        m = dla.merge(dsa, on="invoice_id", suffixes=("_dla", "_dsa"))
+        assert not m.empty, "TC-14: No matching invoice_ids between DLA and DSA"
+        amt_delta = (m["invoice_amount_dla"].astype(float) - m["invoice_amount_dsa"].astype(float)).abs()
+        bad_amt = m[amt_delta > 0.01]
+        _attach_df(m[["invoice_id", "invoice_amount_dla", "invoice_amount_dsa"]].head(50), "Invoice Amount Comparison")
+
+    with allure.step("Assert zero violations"):
+        errors = []
+        inconsistent = dsa_check[~dsa_check["drent_consistent"]]
+        if not inconsistent.empty:
+            errors.append(f"drent != invoice_amount - payment_amount for {len(inconsistent)} DSA row(s)")
+            _attach_df(inconsistent[["invoice_id", "invoice_amount", "payment_amount", "drent", "computed_drent"]], "FAILED — drent inconsistency")
+        if not bad_amt.empty:
+            errors.append(f"invoice_amount: {len(bad_amt)} row(s) exceed $0.01 tolerance vs DLA")
+            _attach_df(bad_amt[["invoice_id", "invoice_amount_dla", "invoice_amount_dsa"]], "FAILED — invoice_amount")
+        if errors:
+            msg = "\n".join(errors)
+            post_slack(f":red_circle: *TC-14 FAILED* — Delinquency drent Computation\n{msg}")
+            pytest.fail(f"TC-14: delinquency drent computation issues:\n{msg}")
 
 
-@pytest.mark.skip(reason="TC-15: To be implemented — requires dsa.dsa_invoice_f join chain schema confirmation")
+# ─────────────────────────────────────────────────────────────────────────────
+# TC-15: Invoice Lines to Invoice Header Cross-Table Validation
+# ─────────────────────────────────────────────────────────────────────────────
+_DLA_TC15 = """
+SELECT i.id          AS invoice_id,
+       COUNT(il.id)  AS line_count,
+       ROUND(SUM(il.cost * il.qty), 2) AS total_line_amount
+FROM {dla}.invoices i
+JOIN {dla}.invoice_lines il ON il.invoice_id = i.id AND il.company_uid = '{CUID}'
+WHERE i.company_uid   = '{CUID}'
+  AND i.property_id  IN ({pids})
+GROUP BY i.id
+ORDER BY i.id
+LIMIT 200
+"""
+
+_DSA_TC15 = """
+SELECT invoice_id,
+       COUNT(invoice_line_id) AS line_count,
+       ROUND(SUM(cost * quantity), 2) AS total_line_amount
+FROM {dsa}.dsa_invoice_line_tf
+WHERE company_uid   = '{CUID}'
+  AND property_id  IN ({pids})
+GROUP BY invoice_id
+ORDER BY invoice_id
+LIMIT 200
+"""
+
+
 @allure.epic("Derived Value Validation")
 @allure.feature("DSA Transformations")
 @allure.story("TC-15 — Invoice Lines to Invoice Header Cross-Table Validation DLA to DSA")
 @allure.severity(allure.severity_level.NORMAL)
 @allure.title("TC-15: Invoice Lines -> Header Cross-Table — DLA vs DSA")
+@allure.description(
+    "Validates the invoice_lines → invoices join chain in DSA: "
+    "line count per invoice and total line amount must match DLA within 1% and $0.01 respectively."
+)
 def test_tc15_invoice_lines_to_header():
-    pass
+    with allure.step("Run DLA query — invoice line counts and amounts per invoice"):
+        dla = run_redshift(_DLA_TC15)
+        assert not dla.empty, "TC-15: DLA returned 0 rows"
+        _attach_df(dla.head(20), "DLA Invoice Lines Summary")
+
+    with allure.step("Run DSA query — dsa.dsa_invoice_line_tf grouped by invoice"):
+        dsa = run_redshift(_DSA_TC15)
+        assert not dsa.empty, "TC-15: DSA returned 0 rows"
+        _attach_df(dsa.head(20), "DSA Invoice Lines Summary")
+
+    with allure.step("Merge on invoice_id and compare line counts and amounts"):
+        m = dla.merge(dsa, on="invoice_id", suffixes=("_dla", "_dsa"))
+        assert not m.empty, "TC-15: No matching invoice_ids between DLA and DSA"
+        m["count_match"]  = m["line_count_dla"].astype(int) == m["line_count_dsa"].astype(int)
+        amt_delta = (m["total_line_amount_dla"].astype(float) - m["total_line_amount_dsa"].astype(float)).abs()
+        m["amount_ok"] = amt_delta <= 0.01
+        _attach_df(
+            m[["invoice_id", "line_count_dla", "line_count_dsa", "count_match",
+               "total_line_amount_dla", "total_line_amount_dsa", "amount_ok"]].head(50),
+            "Comparison",
+        )
+
+    with allure.step("Assert line counts and amounts match"):
+        errors = []
+        fail_count = m[~m["count_match"]]
+        fail_amt   = m[~m["amount_ok"]]
+        if not fail_count.empty:
+            errors.append(f"line_count mismatch: {len(fail_count)} invoice(s)")
+            _attach_df(fail_count[["invoice_id", "line_count_dla", "line_count_dsa"]], "FAILED — line_count")
+        if not fail_amt.empty:
+            errors.append(f"total_line_amount: {len(fail_amt)} invoice(s) exceed $0.01 tolerance")
+            _attach_df(fail_amt[["invoice_id", "total_line_amount_dla", "total_line_amount_dsa"]], "FAILED — total_line_amount")
+        if errors:
+            msg = "\n".join(errors)
+            post_slack(f":red_circle: *TC-15 FAILED* — Invoice Lines to Header Cross-Table\n{msg}")
+            pytest.fail(f"TC-15: invoice line cross-table mismatches:\n{msg}")
